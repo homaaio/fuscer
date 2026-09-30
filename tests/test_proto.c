@@ -141,11 +141,67 @@ static void test_frames(void)
     kv_free(&b);
 }
 
+static void test_hex(void)
+{
+    uint8_t out[8];
+    CHECK(fs_hex_decode("00ff10Ab", 8, out, sizeof out) == 4);
+    CHECK(out[0] == 0x00 && out[1] == 0xff && out[2] == 0x10 && out[3] == 0xab);
+    CHECK(fs_hex_decode("abc", 3, out, sizeof out) == -1);          // odd length
+    CHECK(fs_hex_decode("zz", 2, out, sizeof out) == -1);           // not hex
+    CHECK(fs_hex_decode("", 0, out, sizeof out) == -1);             // empty
+    CHECK(fs_hex_decode("0102030405", 10, out, 4) == -1);           // over the limit
+    CHECK(fs_hex_decode("0102", 4, NULL, sizeof out) == 2);         // validate only
+
+    // Bytes that a plain kv_add would mangle survive kv_add_hex, over a real frame.
+    const uint8_t key[] = "0123456789abcdef";
+    int sv[2];
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    const uint8_t raw[] = { 'a', '\n', 0, '\r', 0xff, '=', 'x', '\n', 'i', 'd', '=', '9' };
+    kvbuf b;
+    kv_init(&b);
+    kv_addf(&b, "id", "%d", 5);
+    kv_add_hex(&b, "data", raw, sizeof raw);
+    CHECK(!b.err);
+    CHECK(fs_send(sv[0], key, 16, MSG_EXEC_OUT, b.p, b.len) == FS_OK);
+
+    int type = 0;
+    char *body = NULL;
+    size_t blen = 0;
+    CHECK(fs_recv(sv[1], key, 16, &type, &body, &blen) == FS_OK);
+    CHECK(type == MSG_EXEC_OUT);
+    CHECK(kv_get_long(body, "id", -1) == 5);            // the "id=9" inside the data must not win
+    char *hex = kv_dup(body, "data");
+    CHECK(hex != NULL);
+    uint8_t back[sizeof raw];
+    CHECK(hex && fs_hex_decode(hex, strlen(hex), back, sizeof back) == (long)sizeof raw);
+    CHECK(hex && memcmp(back, raw, sizeof raw) == 0);
+    free(hex);
+    free(body);
+    kv_free(&b);
+    close(sv[0]);
+    close(sv[1]);
+
+    // kv_dup has no length limit (kv_get truncates)
+    size_t big = 50000;
+    uint8_t *src = malloc(big), *dst = malloc(big);
+    for (size_t i = 0; i < big; i++) src[i] = (uint8_t)(i * 7);
+    kv_init(&b);
+    kv_add_hex(&b, "data", src, big);
+    hex = kv_dup(b.p, "data");
+    CHECK(hex && strlen(hex) == big * 2);
+    CHECK(hex && fs_hex_decode(hex, strlen(hex), dst, big) == (long)big);
+    CHECK(hex && memcmp(src, dst, big) == 0);
+    CHECK(kv_dup(b.p, "nope") == NULL);
+    free(hex); free(src); free(dst);
+    kv_free(&b);
+}
+
 int main(void)
 {
     test_sha();
     test_hmac();
     test_frames();
+    test_hex();
     if (failures) {
         printf("%d check(s) failed\n", failures);
         return 1;

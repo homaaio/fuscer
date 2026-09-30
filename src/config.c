@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -34,6 +35,15 @@ static char *trim(char *s)
     return s;
 }
 
+static int parse_bool(const char *v, int *out)
+{
+    if (!strcasecmp(v, "yes") || !strcasecmp(v, "true") || !strcasecmp(v, "on") || !strcmp(v, "1"))
+        { *out = 1; return 0; }
+    if (!strcasecmp(v, "no") || !strcasecmp(v, "false") || !strcasecmp(v, "off") || !strcmp(v, "0"))
+        { *out = 0; return 0; }
+    return -1;
+}
+
 int cfg_load_file(fs_config *c, const char *path)
 {
     FILE *f = fopen(path, "r");
@@ -60,7 +70,12 @@ int cfg_load_file(fs_config *c, const char *path)
         else if (!strcmp(k, "listen"))      fs_copy(c->listen, sizeof c->listen, v);
         else if (!strcmp(k, "coordinator")) fs_copy(c->coordinator, sizeof c->coordinator, v);
         else if (!strcmp(k, "interval"))    c->interval = atoi(v);
-        else if (!strcmp(k, "key")) {
+        else if (!strcmp(k, "exec")) {
+            if (parse_bool(v, &c->allow_exec) < 0) {
+                LOGE("%s:%d: 'exec' must be yes or no", path, ln);
+                rc = -2;
+            }
+        } else if (!strcmp(k, "key")) {
             fs_copy(c->key, sizeof c->key, v);
             have_key = 1;
         } else {

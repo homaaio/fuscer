@@ -5,7 +5,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define FS_VERSION_STR   "0.1.0"
+#define FS_VERSION_STR   "0.2.0"
 #define FS_DEFAULT_PORT  "7777"
 
 // Logging (stderr, with timestamp). 
@@ -21,6 +21,9 @@ void fs_copy(char *dst, size_t n, const char *src);
 // Set by SIGINT/SIGTERM. Blocking calls are interrupted (no SA_RESTART). 
 extern volatile sig_atomic_t fs_stop;
 void fs_install_signals(void);
+
+// Monotonic clock, milliseconds.
+long long fs_now_ms(void);
 
 // Sleep up to `sec` seconds, wake early when fs_stop is set. 
 void fs_sleep(int sec);

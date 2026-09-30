@@ -17,3 +17,7 @@ coordinator = 192.168.1.10:7777
 # name = laptop-1
 # Heartbeat interval in seconds (default 5).
 # interval = 5
+# Accept remote commands from `fuscer exec` (default: no). Anyone holding the
+# key above can then run anything on this machine as the user running the
+# agent - enable it only on a LAN you trust, and not as root.
+# exec = yes

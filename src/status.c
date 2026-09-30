@@ -89,6 +89,7 @@ int status_run(const fs_config *cfg)
         long cores = GETL("cores", 0);
         long ram_mb = GETL("ram_mb", 0);
         long age = GETL("age", 0);
+        long exec = GETL("exec", 0);
         snprintf(k, sizeof k, "n%ld.load", i);
         double load = kv_get_double(body, k, 0.0);
 #undef GET
@@ -100,8 +101,8 @@ int status_run(const fs_config *cfg)
         fmt_duration(age, ago, sizeof ago);
         strncat(ago, " ago", sizeof ago - strlen(ago) - 1);
 
-        printf("%-16s %-8s %-14s %5ld %7s %5.2f %-7s %-9s %s\n",
-               name, state, osarch, cores, ram, load, gpu, ago,
+        printf("%-16s %-8s %-14s %5ld %7s %5.2f %-7s %-4s %-9s %s\n",
+               name, state, osarch, cores, ram, load, gpu, exec ? "yes" : "-", ago,
                tools[0] ? tools : "-");
     }
 

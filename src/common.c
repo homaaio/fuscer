@@ -57,3 +57,10 @@ void fs_sleep(int sec)
     for (int i = 0; i < sec * 5 && !fs_stop; i++)
         usleep(200000);
 }
+
+long long fs_now_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}

@@ -169,7 +169,8 @@ void kv_addf(kvbuf *b, const char *key, const char *fmt, ...)
     kv_add(b, key, tmp);
 }
 
-int kv_get(const char *body, const char *key, char *out, size_t outsz)
+// Locates the value of `key`; returns a pointer into body and its length.
+static const char *kv_find(const char *body, const char *key, size_t *vlen)
 {
     size_t kl = strlen(key);
     const char *p = body;
@@ -178,17 +179,37 @@ int kv_get(const char *body, const char *key, char *out, size_t outsz)
         const char *nl = strchr(p, '\n');
         size_t ll = nl ? (size_t)(nl - p) : strlen(p);
         if (ll > kl && p[kl] == '=' && memcmp(p, key, kl) == 0) {
-            size_t vl = ll - kl - 1;
-            if (outsz) {
-                if (vl > outsz - 1) vl = outsz - 1;
-                memcpy(out, p + kl + 1, vl);
-                out[vl] = '\0';
-            }
-            return 1;
+            *vlen = ll - kl - 1;
+            return p + kl + 1;
         }
         p = nl ? nl + 1 : p + ll;
     }
-    return 0;
+    return NULL;
+}
+
+int kv_get(const char *body, const char *key, char *out, size_t outsz)
+{
+    size_t vl;
+    const char *v = kv_find(body, key, &vl);
+    if (!v) return 0;
+    if (outsz) {
+        if (vl > outsz - 1) vl = outsz - 1;
+        memcpy(out, v, vl);
+        out[vl] = '\0';
+    }
+    return 1;
+}
+
+char *kv_dup(const char *body, const char *key)
+{
+    size_t vl;
+    const char *v = kv_find(body, key, &vl);
+    if (!v) return NULL;
+    char *r = malloc(vl + 1);
+    if (!r) return NULL;
+    memcpy(r, v, vl);
+    r[vl] = '\0';
+    return r;
 }
 
 long kv_get_long(const char *body, const char *key, long def)
@@ -207,4 +228,49 @@ double kv_get_double(const char *body, const char *key, double def)
     char *end;
     double x = strtod(v, &end);
     return (end == v) ? def : x;
+}
+
+// ---- hex ----
+
+static int hexval(int c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+long fs_hex_decode(const char *s, size_t slen, uint8_t *out, size_t outmax)
+{
+    if (slen == 0 || (slen & 1)) return -1;
+    size_t n = slen / 2;
+    if (n > outmax) return -1;
+    for (size_t i = 0; i < n; i++) {
+        int h = hexval((unsigned char)s[2 * i]);
+        int l = hexval((unsigned char)s[2 * i + 1]);
+        if (h < 0 || l < 0) return -1;
+        if (out) out[i] = (uint8_t)(h << 4 | l);
+    }
+    return (long)n;
+}
+
+void kv_add_hex(kvbuf *b, const char *key, const void *data, size_t n)
+{
+    static const char D[] = "0123456789abcdef";
+    const uint8_t *p = data;
+    char tmp[512];
+
+    kv_put(b, key, strlen(key));
+    kv_put(b, "=", 1);
+    while (n) {
+        size_t k = n > sizeof tmp / 2 ? sizeof tmp / 2 : n;
+        for (size_t i = 0; i < k; i++) {
+            tmp[2 * i]     = D[p[i] >> 4];
+            tmp[2 * i + 1] = D[p[i] & 15];
+        }
+        kv_put(b, tmp, k * 2);
+        p += k;
+        n -= k;
+    }
+    kv_put(b, "\n", 1);
 }

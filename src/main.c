@@ -20,6 +20,7 @@ static void usage(FILE *o)
 "  coordinator        run the coordinator\n"
 "  agent              run an agent on this machine\n"
 "  status             show nodes known to the coordinator\n"
+"  exec NODE CMD...   run a command on a node (the node must enable it)\n"
 "  submit, logs       not implemented in v0.1 (roadmap steps 2+)\n"
 "\n"
 "options:\n"
@@ -28,8 +29,14 @@ static void usage(FILE *o)
 "      --connect ADDR     agent/status: coordinator address, host:port\n"
 "      --name NAME        agent: node name (default: hostname)\n"
 "      --interval SEC     agent: heartbeat interval (default: 5)\n"
+"  -t, --timeout SEC      exec: kill the command after SEC seconds (default: 60)\n"
 "  -h, --help             this help\n"
 "  -V, --version          print version\n"
+"\n"
+"exec: one argument is a shell command line ('make -j4 2>&1 | tail'); several\n"
+"arguments are an argv and are passed through exactly, e.g.\n"
+"  fuscer exec laptop-1 -- gcc --version\n"
+"Exit status is the remote command's; 124 = timeout, 125 = fuscer error.\n"
 "\n"
 "The shared key is read from the config file ('key = ...') or from the\n"
 "FUSCER_KEY environment variable. It is intentionally not a command-line\n"
@@ -42,10 +49,34 @@ static const struct option LONG_OPTS[] = {
     { "connect",  required_argument, NULL, 'C' },
     { "name",     required_argument, NULL, 'n' },
     { "interval", required_argument, NULL, 'i' },
+    { "timeout",  required_argument, NULL, 't' },
     { "help",     no_argument,       NULL, 'h' },
     { "version",  no_argument,       NULL, 'V' },
     { NULL, 0, NULL, 0 }
 };
+
+// One argument: a shell command line, used as is. Several: an argv, each word
+// single-quoted so the shell on the node hands them over unchanged.
+static char *build_command(int n, char **args)
+{
+    if (n == 1) return strdup(args[0]);
+
+    size_t cap = 1;
+    for (int i = 0; i < n; i++) cap += strlen(args[i]) * 4 + 3;
+    char *out = malloc(cap), *p = out;
+    if (!out) return NULL;
+    for (int i = 0; i < n; i++) {
+        if (i) *p++ = ' ';
+        *p++ = '\'';
+        for (const char *c = args[i]; *c; c++) {
+            if (*c == '\'') { memcpy(p, "'\\''", 4); p += 4; }
+            else *p++ = *c;
+        }
+        *p++ = '\'';
+    }
+    *p = '\0';
+    return out;
+}
 
 int main(int argc, char **argv)
 {
@@ -64,7 +95,7 @@ int main(int argc, char **argv)
 
     const char *cmd = argv[1];
     if (strcmp(cmd, "coordinator") && strcmp(cmd, "agent") &&
-        strcmp(cmd, "status")) {
+        strcmp(cmd, "status") && strcmp(cmd, "exec")) {
         if (!strcmp(cmd, "submit") || !strcmp(cmd, "logs")) {
             fprintf(stderr, "fuscer: '%s' is not implemented in v0.1\n", cmd);
             return 2;
@@ -81,7 +112,8 @@ int main(int argc, char **argv)
 
     opterr = 0;
     int o;
-    while ((o = getopt_long(ac, av, "c:hV", LONG_OPTS, NULL)) != -1)
+    int exec_timeout = 60;
+    while ((o = getopt_long(ac, av, "+c:t:hV", LONG_OPTS, NULL)) != -1)
         if (o == 'c') conf_path = optarg;
 
     fs_config cfg;
@@ -106,13 +138,14 @@ int main(int argc, char **argv)
 
     optind = 1;
     opterr = 1;
-    while ((o = getopt_long(ac, av, "c:hV", LONG_OPTS, NULL)) != -1) {
+    while ((o = getopt_long(ac, av, "+c:t:hV", LONG_OPTS, NULL)) != -1) {
         switch (o) {
         case 'c': break;
         case 'L': fs_copy(cfg.listen, sizeof cfg.listen, optarg); break;
         case 'C': fs_copy(cfg.coordinator, sizeof cfg.coordinator, optarg); break;
         case 'n': fs_copy(cfg.name, sizeof cfg.name, optarg); break;
         case 'i': cfg.interval = atoi(optarg); break;
+        case 't': exec_timeout = atoi(optarg); break;
         case 'h': usage(stdout); return 0;
         case 'V': puts("fuscer " FS_VERSION_STR); return 0;
         default:  usage(stderr); return 2;
@@ -138,6 +171,33 @@ int main(int argc, char **argv)
             fprintf(stderr, "fuscer: interval must be 1..3600 seconds\n");
             return 2;
         }
+    }
+
+    if (!strcmp(cmd, "exec")) {
+        int rest = ac - optind;
+        char **ra = av + optind;
+        if (rest >= 2 && !strcmp(ra[1], "--")) {      // NODE -- CMD...
+            memmove(ra + 1, ra + 2, (size_t)(rest - 2) * sizeof *ra);
+            rest--;
+        }
+        if (rest < 2) {
+            fprintf(stderr, "usage: fuscer exec [--timeout SEC] NODE [--] COMMAND...\n");
+            return 2;
+        }
+        if (!cfg_name_ok(ra[0])) {
+            fprintf(stderr, "fuscer: invalid node name '%s'\n", ra[0]);
+            return 2;
+        }
+        if (exec_timeout < 1 || exec_timeout > 3600) {
+            fprintf(stderr, "fuscer: timeout must be 1..3600 seconds\n");
+            return 2;
+        }
+        char *line = build_command(rest - 1, ra + 1);
+        if (!line) return 2;
+        fs_install_signals();
+        int st = exec_run(&cfg, ra[0], line, exec_timeout);
+        free(line);
+        return st;
     }
 
     fs_install_signals();

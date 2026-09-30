@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <poll.h>
+#include <stdint.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -19,8 +20,28 @@
 #define MAX_CONNS 256
 #define MIN_NODE_TIMEOUT 15   // seconds without a heartbeat => offline 
 
+#define EXEC_MAX_OUT   (8L * 1024 * 1024)   // per job, buffered on the coordinator
+#define EXEC_CHUNK     16384
+
+// A remote command in flight. Created and freed by the client's thread; the
+// node's agent thread fills in output and the result. All fields are guarded
+// by g_mu. `done` is set exactly once, and only then is the job unlinked
+// from its node.
+typedef struct job {
+    long     id;
+    char    *cmd_hex;
+    int      timeout;
+    int      sent, kill_req, kill_sent, done;
+    uint8_t *buf;                 // output not yet forwarded to the client
+    size_t   len, cap;
+    long     total;
+    long     exit_code, sig, ms;
+    char     reason[32], error[160];
+} job_t;
+
 typedef struct {
-    int      used, online;
+    int      used, online, exec;
+    job_t   *job;                 // at most one command per node (step 2)
     unsigned gen;                 // identifies the current connection 
     char     name[64], os[32], kernel[64], distro[96], arch[32];
     char     gpu[16], tools[256], addr[64];
@@ -32,7 +53,9 @@ typedef struct {
 
 static node_t          g_nodes[MAX_NODES];
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  g_cv = PTHREAD_COND_INITIALIZER;   // signals job progress
 static unsigned        g_gen;
+static long            g_jobid;
 static time_t          g_start;
 static atomic_int      g_conns;
 static uint8_t         g_key[256];
@@ -54,6 +77,14 @@ static node_t *slot_for(const char *name)
         if (!g_nodes[i].used && !free_slot) free_slot = &g_nodes[i];
     }
     return free_slot;
+}
+
+static node_t *find_node(const char *name)
+{
+    for (int i = 0; i < MAX_NODES; i++)
+        if (g_nodes[i].used && strcmp(g_nodes[i].name, name) == 0)
+            return &g_nodes[i];
+    return NULL;
 }
 
 static int cmp_nodes(const void *a, const void *b)
@@ -107,6 +138,7 @@ static void handle_status(conn_t *c)
         ADD("cores",  "%d",   x->cores);
         ADD("ram_mb", "%ld",  x->ram_mb);
         ADD("gpu",    "%s",   x->gpu);
+        ADD("exec",   "%d",   x->exec);
         ADD("tools",  "%s",   x->tools);
         ADD("load",   "%.2f", x->load);
         ADD("age",    "%ld",  (long)(now - x->last_seen));
@@ -116,6 +148,100 @@ static void handle_status(conn_t *c)
 
     if (!b.err) fs_send(c->fd, g_key, g_klen, MSG_STATUS_RESP, b.p, b.len);
     kv_free(&b);
+}
+
+// ---------- exec jobs (all called with g_mu held) ----------
+
+static void job_complete(job_t *j, const char *error)
+{
+    if (error && !j->error[0]) fs_copy(j->error, sizeof j->error, error);
+    j->done = 1;
+    pthread_cond_broadcast(&g_cv);
+}
+
+static void job_on_out(node_t *n, const char *body)
+{
+    job_t *j = n->job;
+    if (!j || kv_get_long(body, "id", -1) != j->id) return;
+
+    char *hex = kv_dup(body, "data");
+    if (!hex) return;
+    size_t hl = strlen(hex);
+    uint8_t *tmp = malloc(hl / 2 + 1);
+    long dn = tmp ? fs_hex_decode(hex, hl, tmp, hl / 2) : -1;
+    free(hex);
+
+    if (dn > 0 && j->total < EXEC_MAX_OUT) {
+        if (j->len + (size_t)dn > j->cap) {
+            size_t nc = j->cap ? j->cap : 4096;
+            while (nc < j->len + (size_t)dn) nc *= 2;
+            uint8_t *nb = realloc(j->buf, nc);
+            if (nb) { j->buf = nb; j->cap = nc; }
+        }
+        if (j->len + (size_t)dn <= j->cap) {
+            memcpy(j->buf + j->len, tmp, (size_t)dn);
+            j->len += (size_t)dn;
+            j->total += dn;
+        }
+        if (j->total >= EXEC_MAX_OUT) j->kill_req = 1;
+        pthread_cond_broadcast(&g_cv);
+    }
+    free(tmp);
+}
+
+static void job_on_done(node_t *n, const char *body)
+{
+    job_t *j = n->job;
+    if (!j || kv_get_long(body, "id", -1) != j->id) return;   // stale: ignore
+
+    j->exit_code = kv_get_long(body, "exit", -1);
+    j->sig = kv_get_long(body, "signal", 0);
+    j->ms = kv_get_long(body, "ms", 0);
+    kv_get(body, "reason", j->reason, sizeof j->reason);
+    kv_get(body, "error", j->error, sizeof j->error);
+    n->job = NULL;
+    job_complete(j, NULL);
+}
+
+// Sends the agent whatever the clients have queued for it. Returns 0, 1 if this
+// connection was superseded by a newer one, -1 if the socket failed.
+static int push_work(conn_t *c, node_t *n, unsigned gen)
+{
+    kvbuf run, kill;
+    kv_init(&run);
+    kv_init(&kill);
+    int superseded = 0;
+
+    pthread_mutex_lock(&g_mu);
+    if (n->gen != gen) {
+        superseded = 1;
+    } else if (n->job) {
+        job_t *j = n->job;
+        if (!j->sent) {
+            j->sent = 1;
+            kv_addf(&run, "id", "%ld", j->id);
+            kv_addf(&run, "timeout", "%d", j->timeout);
+            kv_add(&run, "cmd", j->cmd_hex);
+        } else if (j->kill_req && !j->kill_sent) {
+            j->kill_sent = 1;
+            kv_addf(&kill, "id", "%ld", j->id);
+        }
+    }
+    pthread_mutex_unlock(&g_mu);
+
+    int rc = FS_OK;
+    if (superseded) {
+        rc = 1;
+    } else if (run.err || kill.err) {
+        rc = -1;
+    } else if (run.len) {
+        rc = fs_send(c->fd, g_key, g_klen, MSG_EXEC_RUN, run.p, run.len) == FS_OK ? 0 : -1;
+    } else if (kill.len) {
+        rc = fs_send(c->fd, g_key, g_klen, MSG_EXEC_KILL, kill.p, kill.len) == FS_OK ? 0 : -1;
+    }
+    kv_free(&run);
+    kv_free(&kill);
+    return rc;
 }
 
 static void handle_agent(conn_t *c, const char *hello)
@@ -144,7 +270,9 @@ static void handle_agent(conn_t *c, const char *hello)
         return;
     }
     int replaced = n->used && n->online;
+    job_t *orphan = n->job;              // a command running over the old connection
     memset(n, 0, sizeof *n);
+    if (orphan) job_complete(orphan, "node reconnected");
     n->used = 1;
     n->online = 1;
     n->gen = ++g_gen;
@@ -158,13 +286,15 @@ static void handle_agent(conn_t *c, const char *hello)
     n->cores = (int)kv_get_long(hello, "cores", 0);
     n->ram_mb = kv_get_long(hello, "ram_mb", 0);
     n->load = kv_get_double(hello, "load", 0.0);
+    n->exec = kv_get_long(hello, "exec", 0) != 0;
     fs_copy(n->addr, sizeof n->addr, c->peer);
     n->connected = n->last_seen = time(NULL);
     unsigned gen = n->gen;
     pthread_mutex_unlock(&g_mu);
 
-    LOGI("node '%s' registered from %s (%d cores, %ld MB RAM)%s", name, c->peer,
+    LOGI("node '%s' registered from %s (%d cores, %ld MB RAM, exec %s)%s", name, c->peer,
          (int)kv_get_long(hello, "cores", 0), kv_get_long(hello, "ram_mb", 0),
+         kv_get_long(hello, "exec", 0) ? "ON" : "off",
          replaced ? " [replaced old connection]" : "");
 
     kvbuf b;
@@ -178,9 +308,34 @@ static void handle_agent(conn_t *c, const char *hello)
     }
     kv_free(&b);
 
-    // ---- heartbeat loop ---- 
+    // ---- main loop: this thread is the only writer to the agent's socket ---- 
     net_set_timeouts(c->fd, timeout);
+    long long last_rx = fs_now_ms();
     while (!fs_stop) {
+        int pw = push_work(c, n, gen);
+        if (pw > 0) {
+            LOGI("node '%s': connection superseded by a newer one", name);
+            break;
+        }
+        if (pw < 0) {
+            LOGW("node '%s': send failed", name);
+            break;
+        }
+
+        struct pollfd pfd = { .fd = c->fd, .events = POLLIN };
+        int pr = poll(&pfd, 1, 200);
+        if (pr < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        if (pr == 0) {
+            if (fs_now_ms() - last_rx > timeout * 1000LL) {
+                LOGW("node '%s': %s", name, fs_strerror(FS_ERR_TIMEOUT));
+                break;
+            }
+            continue;
+        }
+
         int type;
         char *body;
         size_t blen;
@@ -189,19 +344,22 @@ static void handle_agent(conn_t *c, const char *hello)
             LOGW("node '%s': %s", name, fs_strerror(rc));
             break;
         }
-        if (type != MSG_HEARTBEAT) {
-            LOGW("node '%s': unexpected message type %d", name, type);
-            free(body);
-            break;
-        }
+        last_rx = fs_now_ms();
 
-        int superseded = 0;
+        int superseded = 0, bad = 0;
         pthread_mutex_lock(&g_mu);
         if (n->gen != gen) {
             superseded = 1;
         } else {
-            n->load = kv_get_double(body, "load", n->load);
             n->last_seen = time(NULL);
+            switch (type) {
+            case MSG_HEARTBEAT:
+                n->load = kv_get_double(body, "load", n->load);
+                break;
+            case MSG_EXEC_OUT:  job_on_out(n, body);  break;
+            case MSG_EXEC_DONE: job_on_done(n, body); break;
+            default: bad = 1;
+            }
         }
         pthread_mutex_unlock(&g_mu);
         free(body);
@@ -210,16 +368,153 @@ static void handle_agent(conn_t *c, const char *hello)
             LOGI("node '%s': connection superseded by a newer one", name);
             break;
         }
-        if (fs_send(c->fd, g_key, g_klen, MSG_HEARTBEAT_OK, "", 0) != FS_OK) break;
+        if (bad) {
+            LOGW("node '%s': unexpected message type %d", name, type);
+            break;
+        }
+        if (type == MSG_HEARTBEAT &&
+            fs_send(c->fd, g_key, g_klen, MSG_HEARTBEAT_OK, "", 0) != FS_OK)
+            break;
     }
 
 out:
     pthread_mutex_lock(&g_mu);
     if (n->used && n->gen == gen) {
         n->online = 0;
+        if (n->job) {                    // the command's result is lost with the connection
+            job_t *j = n->job;
+            n->job = NULL;
+            job_complete(j, "node disconnected");
+        }
         LOGI("node '%s' is offline", name);
     }
     pthread_mutex_unlock(&g_mu);
+}
+
+// ---------- exec requests from clients ----------
+
+static void send_exec_done(conn_t *c, long id, long code, long sig, const char *reason,
+                           const char *error, long ms)
+{
+    kvbuf b;
+    kv_init(&b);
+    kv_addf(&b, "id", "%ld", id);
+    kv_addf(&b, "exit", "%ld", code);
+    kv_addf(&b, "signal", "%ld", sig);
+    kv_add(&b, "reason", reason);
+    kv_add(&b, "error", error);
+    kv_addf(&b, "ms", "%ld", ms);
+    if (!b.err) fs_send(c->fd, g_key, g_klen, MSG_EXEC_DONE, b.p, b.len);
+    kv_free(&b);
+}
+
+static int forward_out(conn_t *c, long id, const uint8_t *d, size_t n)
+{
+    while (n) {
+        size_t k = n > EXEC_CHUNK ? EXEC_CHUNK : n;
+        kvbuf b;
+        kv_init(&b);
+        kv_addf(&b, "id", "%ld", id);
+        kv_add_hex(&b, "data", d, k);
+        int rc = b.err ? FS_ERR_IO : fs_send(c->fd, g_key, g_klen, MSG_EXEC_OUT, b.p, b.len);
+        kv_free(&b);
+        if (rc != FS_OK) return -1;
+        d += k;
+        n -= k;
+    }
+    return 0;
+}
+
+static void handle_exec(conn_t *c, const char *req)
+{
+    char node[64] = "";
+    kv_get(req, "node", node, sizeof node);
+    long timeout = kv_get_long(req, "timeout", 60);
+    char *hex = kv_dup(req, "cmd");
+
+    if (!cfg_name_ok(node) || timeout < 1 || timeout > 3600 || !hex ||
+        fs_hex_decode(hex, strlen(hex), NULL, FS_MAX_CMD) < 0) {
+        free(hex);
+        send_error(c, "bad exec request");
+        return;
+    }
+
+    job_t *j = calloc(1, sizeof *j);
+    if (!j) { free(hex); send_error(c, "out of memory"); return; }
+    j->cmd_hex = hex;
+    j->timeout = (int)timeout;
+
+    const char *err = NULL;
+    pthread_mutex_lock(&g_mu);
+    node_t *n = find_node(node);
+    if (!n)              err = "no such node";
+    else if (!n->online) err = "node is offline";
+    else if (!n->exec)   err = "exec is disabled on this node (agent config: exec = yes)";
+    else if (n->job)     err = "node is busy";
+    else {
+        j->id = ++g_jobid;
+        n->job = j;
+    }
+    pthread_mutex_unlock(&g_mu);
+
+    if (err) {
+        send_exec_done(c, 0, -1, 0, "", err, 0);
+        goto cleanup;
+    }
+    LOGI("exec #%ld on '%s' requested by %s", j->id, node, c->peer);
+
+    // The agent enforces the timeout; this is only a safety net for a node that
+    // stops answering without dropping the connection.
+    long long limit = fs_now_ms() + (timeout + 20) * 1000LL;
+    int client_gone = 0;
+
+    for (;;) {
+        pthread_mutex_lock(&g_mu);
+        if (!j->done && j->len == 0) {
+            struct timespec ts;
+            clock_gettime(CLOCK_REALTIME, &ts);
+            ts.tv_nsec += 200 * 1000000L;
+            if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+            pthread_cond_timedwait(&g_cv, &g_mu, &ts);
+        }
+        uint8_t *data = j->buf;
+        size_t dlen = j->len;
+        j->buf = NULL;
+        j->len = j->cap = 0;
+        if (!j->done && (fs_stop || fs_now_ms() > limit)) {
+            if (n->job == j) n->job = NULL;          // give up on this job
+            job_complete(j, fs_stop ? "coordinator is shutting down" : "no answer from node");
+        }
+        int done = j->done;
+        pthread_mutex_unlock(&g_mu);
+
+        if (dlen && !client_gone && forward_out(c, j->id, data, dlen) != 0) client_gone = 1;
+        free(data);
+
+        if (!client_gone) {          // the client sends nothing after its request
+            char ch;
+            ssize_t r = recv(c->fd, &ch, 1, MSG_PEEK | MSG_DONTWAIT);
+            if (r >= 0 || (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR))
+                client_gone = 1;
+        }
+        if (client_gone && !done) {
+            pthread_mutex_lock(&g_mu);
+            if (!j->kill_req) LOGI("exec #%ld: client went away, killing the command", j->id);
+            j->kill_req = 1;
+            pthread_mutex_unlock(&g_mu);
+        }
+
+        if (done) {
+            if (!client_gone)
+                send_exec_done(c, j->id, j->exit_code, j->sig, j->reason, j->error, j->ms);
+            break;
+        }
+    }
+
+cleanup:
+    free(j->cmd_hex);
+    free(j->buf);
+    free(j);
 }
 
 // ---------- connection thread ---------- 
@@ -243,6 +538,7 @@ static void *conn_thread(void *arg)
         switch (type) {
         case MSG_HELLO:      handle_agent(c, body);  break;
         case MSG_STATUS_REQ: handle_status(c);       break;
+        case MSG_EXEC_REQ:   handle_exec(c, body);   break;
         default:
             LOGW("%s: unexpected first message type %d", c->peer, type);
             send_error(c, "unexpected message");

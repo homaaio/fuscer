@@ -7,6 +7,7 @@ typedef struct {
     char coordinator[128];  // agent/status: coordinator address, host:port 
     char key[256];          // shared secret (HMAC) 
     int  interval;          // agent: heartbeat interval, seconds 
+    int  allow_exec;        // agent: accept remote exec (default: off) 
 } fs_config;
 
 void cfg_defaults(fs_config *c);
