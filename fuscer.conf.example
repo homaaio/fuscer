@@ -1,0 +1,19 @@
+# fuscer.conf - copy to ./fuscer.conf or /etc/fuscer.conf, then: chmod 600
+#
+# Shared secret. Must be identical on the coordinator, all agents and
+# wherever you run `fuscer status`. Generate one with:
+#   head -c 24 /dev/urandom | base64
+key = CHANGE-ME-to-a-long-random-string
+
+# --- coordinator ---
+# Address of the LAN interface to listen on (NOT 0.0.0.0 unless you mean it).
+listen = 192.168.1.10:7777
+
+# --- agent and `fuscer status` ---
+coordinator = 192.168.1.10:7777
+
+# --- agent ---
+# Node name, default: hostname. Allowed: A-Z a-z 0-9 . _ -
+# name = laptop-1
+# Heartbeat interval in seconds (default 5).
+# interval = 5
